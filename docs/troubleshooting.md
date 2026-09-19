@@ -1,125 +1,35 @@
 # Troubleshooting
 
-Start with:
+Start with `opensandbox status`, `opensandbox nodes`, `opensandbox doctor` and
+`opensandbox logs` on the head. Use `--json` for machine-readable output.
 
-```bash
-sandboxpilot doctor            # control plane, state, SkyPilot, clouds, ssh, pools, workers
-sandboxpilot daemon status     # is the local control plane up, pid, log path
-sandboxpilot daemon logs -n 200
-sandboxpilot --json status     # everything the control plane knows, including per-worker capacity
-```
+| Symptom | Check |
+| --- | --- |
+| Setup rejects the head IP | Run setup on that machine; `head.host` must be one of its IPv4 addresses. |
+| SSH or sudo fails | Verify the host key, SSH key/user/port and passwordless sudo on the worker. |
+| Existing cluster is rejected | Use clean machines; setup will not overwrite an unmanaged K3s cluster. |
+| Worker never joins | Worker → head TCP 6443, node names, CIDR conflicts and `opensandbox logs --node NAME`. |
+| Node remains unavailable | Cilium connectivity, Linux kernel support and gVisor smoke-test output. No fallback runtime is enabled. |
+| Sandbox creation times out | Available CPU/RAM/disk on one node, image pull credentials, architecture and image compatibility. |
+| E2B commands fail to start | The image needs `/bin/bash`. Use the supplied `base` template to establish a baseline. |
+| HTTPS certificate error | Trust `api-ca.crt` on the client. Python's native macOS verifier needs Keychain trust; Node supports `NODE_EXTRA_CA_CERTS`. |
+| getHost URL cannot resolve | Allow sslip.io DNS or configure your own wildcard DNS and matching `sandbox_domain`. |
+| SDK works but app URL fails | Bind the app port, confirm the returned hostname points to the head, and preserve Host in any reverse proxy. |
+| Runtime access returns unauthorized | Check the sandbox token, owner-key revocation and sandbox lifetime. API keys and runtime tokens are distinct. |
+| Private application returns unauthorized | Send the returned traffic token in `e2b-traffic-access-token`. |
+| No internet/DNS in sandbox | Check egress rules and reachability of public DNS. Private/cluster/metadata access is deliberately blocked. |
+| Build cannot schedule | One worker needs the build request plus overhead: 2 cores, 4 GiB RAM and 20 GiB disk. |
+| Build fails pulling a private base | Configure registry credentials and any external `token_realm`, then rerun setup. |
+| Lost sandbox after worker failure | Sandboxes are ephemeral. Create a replacement and restore application data from your own durable store. |
+| Node removal times out | It is already cordoned. Wait for workloads or explicitly use `--force`. The machine is never terminated. |
+| Image deletion does not free disk | Registry blob garbage collection is a separate maintenance operation. |
+| API fails after reboot | Inspect `sudo journalctl -u opensandbox` and `sudo journalctl -u k3s`. Saved state is under `/var/lib/opensandbox`. |
 
-## The control plane does not start
+Run `opensandbox restart` after deliberate head configuration changes. Existing
+sandbox processes survive API restarts, while builds interrupted by a restart
+must be retried. Rerun initialization to refresh the API certificate before its
+one-year leaf lifetime expires; the ten-year cluster CA remains unchanged.
 
-`The control plane did not become healthy at http://127.0.0.1:7070 within 20s`
-
-- Read `sandboxpilot daemon logs`. Typical causes: a broken `config.yaml`
-  (`Invalid configuration: ...`), the port in use, or a state database written by a
-  newer SandboxPilot (`Upgrade SandboxPilot`).
-- `SANDBOXPILOT_API_URL` pointing at a remote host disables autostart: start the
-  control plane there, or unset the variable.
-- Binding to anything other than loopback requires `api.token`.
-
-## Worker provisioning fails
-
-Provisioning is a SkyPilot launch plus a bootstrap script. `sandboxpilot pool up`
-prints the failure; `sandboxpilot --json status` shows `last_error` per worker.
-
-| message | fix |
-|---|---|
-| `credentials for ... are unavailable` | `sky check`; configure the cloud CLI ([clouds](clouds.md)) |
-| `no available capacity on ... for the requested worker size` | another region (`pool create --region`), a smaller worker, or another cloud |
-| `cloud quota limit` | request a quota increase or use a different instance type/cloud |
-| `Worker bootstrap on the cloud VM failed or timed out` | `sky logs sp-<pool>-<id>` shows the bootstrap output; see below |
-| `worker protocol version ... incompatible` | the VM installed a different SandboxPilot; reprovision after upgrading both sides |
-
-Bootstrap requirements on the VM: Ubuntu LTS or Debian, systemd, passwordless sudo,
-outbound internet. The script fails (and the worker is terminated) if Docker does not
-expose the `runsc` runtime after installing gVisor, or if the worker's own gVisor
-smoke test fails. Running from a source checkout uploads a wheel of your checkout
-(`SANDBOXPILOT_WORKER_INSTALL=local`); a release install pulls `sandboxpilot[worker]`
-from PyPI (`=release`).
-
-Leftover VMs: `sky status` lists every cluster; `sky down <name>` removes one;
-`sandboxpilot cleanup --workers` terminates everything the control plane knows about.
-
-## Worker is UNHEALTHY or LOST
-
-- `UNHEALTHY`: health checks fail but SkyPilot still reports the VM up. The tunnel is
-  re-opened on every check; try `ssh sp-<pool>-<id>` (SkyPilot's alias) and
-  `sudo journalctl -u sandboxpilot-worker` on the VM.
-- `LOST`: the VM disappeared (spot preemption, manual termination). Its sandboxes are
-  `LOST`; a replacement is provisioned if the pool is below `min_workers`.
-- Workers that were mid-provision when the control plane restarted are terminated on
-  startup unless SkyPilot reports them up, in which case they are re-adopted.
-
-## Sandbox problems
-
-| symptom | cause |
-|---|---|
-| `no_capacity: ... can never fit on a ... worker` | request exceeds a whole worker after reserves; smaller sandbox or bigger `workers` |
-| `create_timeout` | at `max_workers` with no free capacity, or provisioning slower than `create_timeout` |
-| `sandbox_lost` | worker gone; create a new sandbox |
-| state `EXPIRED` | hit its `timeout`; use `sb.set_timeout()` or a longer default |
-| `Sandbox readiness check failed ... must provide /bin/sh` | shell-less image; pass `keepalive_command` and use `args=[...]` for commands |
-| `Image pull failed` | wrong reference, or private registry: configure Docker credentials on the workers |
-| `Sandbox process was terminated after exceeding its ... memory limit` | OOM; raise `memory` |
-| command `TIMED_OUT` | `timeout` elapsed; the process tree was killed |
-
-Command output is truncated to `limits.max_command_output_bytes` (head and tail
-kept). Stream (`sb.stream`) to see everything.
-
-DNS inside sandboxes uses public resolvers (`8.8.8.8`, `1.1.1.1`); Docker's embedded
-DNS does not work under gVisor. Override with `SANDBOXPILOT_WORKER_SANDBOX_DNS` in the
-worker environment if your egress policy requires specific resolvers.
-
-Files written by the sandbox are downloaded through `tar` run inside it. Images without
-`tar` fall back to `docker cp`, which under gVisor only sees files written before the
-sandbox first touched the directory; use an image that ships `tar` (almost all do).
-
-## SkyPilot API server (0.9+)
-
-SkyPilot runs a local API server (`sky api status`). It is shared by every SkyPilot
-install on the machine; if a different project's install has a stale server on port
-46580, `sky check` fails to start one — `sky api stop` then retry. A launch in flight
-dies with `ConnectionError ... /api/stream` if something restarts that server: the
-worker is terminated and `sandboxpilot up` can simply be re-run.
-
-## GCP notes (measured)
-
-- New projects need `compute`, `cloudresourcemanager`, `iam` and `storage` APIs
-  enabled (`gcloud services enable ...`); `sky check gcp` reports which are missing.
-  API enablement takes a few minutes to propagate.
-- `n4-standard-8` capacity varies by zone; SkyPilot fails over across zones and
-  regions automatically (observed: all of `us-central1` exhausted, landed in
-  `us-east1-b`).
-- Request-to-HEALTHY for a worker: about 300 s. Warm-slot claim: ~30 ms on the worker;
-  end-to-end create from a distant client is dominated by the SSH round trip
-  (450 ms from Asia to `us-east1`).
-
-## Proxy URLs
-
-`get_url` returns `http://<api>/v1/proxy/<sandbox>/<port>/<token>/`. A `401` means the
-token expired (`limits.proxy_url_ttl_seconds`) or the URL was altered; `502` means
-nothing listens on that port inside the sandbox (or `network: none`). If clients
-cannot reach `127.0.0.1:7070`, set `api.external_url`.
-
-## Running a worker by hand (Linux, Docker + gVisor)
-
-```bash
-pip install "sandboxpilot[worker]"
-sudo runsc install && sudo systemctl restart docker
-export SANDBOXPILOT_WORKER_TOKEN=$(python -c 'import secrets;print(secrets.token_urlsafe(32))')
-sudo -E python -m sandboxpilot.worker.setup --network --firewall --doctor
-sudo -E sandboxpilot-worker            # listens on 127.0.0.1:9417
-```
-
-`pytest -m gvisor` runs the real-runtime tests against it. Without gVisor,
-`SANDBOXPILOT_WORKER_RUNTIME=docker-unsafe SANDBOXPILOT_DEV_UNSAFE_RUNTIME=1` uses
-plain `runc` for development only; it provides no isolation.
-
-## Resetting
-
-`sandboxpilot daemon stop`, then delete the state directory
-(`~/.local/share/sandboxpilot`, or `SANDBOXPILOT_STATE_DIR`). Workers keep running:
-terminate them with `sky down <cluster>` first if you want the bill to stop.
+For deeper infrastructure diagnostics, administrators can use K3s tools on the
+head. Applications do not need Kubernetes configuration or worker addresses.
+Do not delete state directories as a general troubleshooting step.

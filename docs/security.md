@@ -1,68 +1,52 @@
-# Security model
+# Security boundaries
 
-What a sandbox can and cannot do, and what you are trusting.
+All user sandboxes and image builders require RuntimeClass `gvisor` with the
+`runsc` handler. Nodes receive the scheduling label only after a successful
+runtime smoke test. Creation checks the configured handler, node label, running
+pod and companion kernel attestation. The production companion refuses to start
+unless its direct syslog syscall identifies the gVisor kernel.
 
-## Isolation
+User pods have no host mounts, container socket, host namespaces or Kubernetes
+service-account token. They drop Linux capabilities and prohibit privilege
+escalation. The sandbox user is root **inside gVisor**; changing to another user
+is currently rejected. Image builders receive the additional capabilities needed
+to unpack image layers, still inside gVisor. Head services and the registry are
+trusted infrastructure, not user sandboxes.
 
-- Every sandbox is a gVisor (`runsc`) container. Sandboxed code talks to gVisor's
-  user-space kernel (the Sentry), not the host kernel. The host kernel sees one
-  heavily seccomp-restricted process per sandbox.
-- Workers refuse to start if Docker does not have a working `runsc` runtime. There is
-  no silent fallback to `runc`. The dev-only `--unsafe-runc` worker flag exists for
-  laptops without gVisor and prints a warning on every start.
-- Containers run with all capabilities dropped except the few needed to
-  `chown`/`setuid` inside the sandbox, `no-new-privileges`, a private IPC namespace,
-  a pids limit, and CPU/memory cgroups. No privileged mode. The only host mount is a
-  read-only `/etc/resolv.conf` naming public resolvers (`8.8.8.8`, `1.1.1.1` by
-  default; `SANDBOXPILOT_WORKER_SANDBOX_DNS` on the worker): gVisor cannot reach
-  Docker's embedded DNS, and the cloud's metadata resolver is blocked on purpose.
-- gVisor defaults are kept: `systrap` platform, `directfs`, self-backed rootfs
-  overlay (writes never reach the image layers), netstack networking.
+CPU and memory use Kubernetes limits. Ephemeral disk uses kubelet accounting and
+eviction, so a burst may exceed the requested size before eviction. Pod process
+host PID count is limited to 1,024, and the companion accepts up to 128 active
+command sessions. gVisor tasks do not map one-to-one to host PIDs; this is not
+a separate 1,024-task guest quota ([gVisor resource model](https://gvisor.dev/docs/architecture_guide/resources/)).
+API bodies, archive expansion and retained process
+output are bounded. File transfers reject tar traversal, symlinks and special
+files; E2B filesystem operations deliberately address the sandbox's own filesystem.
 
-## Network
+Namespaces have default-deny ingress/egress. Public internet egress explicitly
+excludes private, metadata, reserved, pod, service and node addresses. Cilium
+also denies host, remote-node, API and cluster entities. The default DNS servers
+are public. Image builders have a narrow additional exception to the head's
+pull gateway; production user sandboxes do not receive it.
 
-- Sandboxes attach to a dedicated, IPv4-only Docker bridge (`enable_icc=false`, so
-  sandboxes cannot see each other). iptables rules scoped to that bridge reject
-  traffic to `169.254.0.0/16` (cloud metadata), `10.0.0.0/8`, `172.16.0.0/12`,
-  `192.168.0.0/16` and `100.64.0.0/10`, and reject anything addressed to the worker
-  VM itself (its sshd, Docker, the worker API). A sandbox cannot reach the VM's
-  instance credentials, the host, or anything else in your VPC. Return traffic for
-  connections the sandbox opened is allowed. IPv6 is not enabled on the sandbox
-  network, so there is no v6 path to filter.
-- `network: none` gives a sandbox no interface at all.
-- The worker API listens on the VM's loopback only. The control plane reaches it via
-  `ssh -L`, using the SkyPilot-managed key. No security-group changes beyond SSH.
-- Exposed ports (`get_url`) go through the control plane's signed-URL proxy:
-  HMAC-SHA256 over sandbox id + port + expiry, verified on every request and on
-  WebSocket upgrade. Tampering with the port or the sandbox id invalidates the token.
+The API requires bearer or E2B API-key authentication. Key secrets are random;
+SQLite stores SHA-256 hashes. Application keys own separate sandbox records.
+Administrator keys can inspect and destroy all sandboxes and manage templates
+and keys. Runtime tokens are scoped to one sandbox and are rejected after its
+owner key is revoked or its lifetime ends. Template/image catalogs are shared
+within this administrator-managed cluster; they are not separate tenant registries.
 
-## Authentication
+E2B application URLs allow public traffic by default, matching the SDK contract.
+Private application URLs require a separate traffic token. Native signed port
+URLs expire and never permit access to the internal companion port. Proxy code
+removes control-plane credentials before forwarding application requests.
 
-- Control plane on loopback: no token by default (only your user can reach it).
-  Binding to anything else requires `api.token`; every route except `/v1/health`
-  then demands `Authorization: Bearer <token>`, compared in constant time.
-- Each worker gets a random 256-bit token at provision time, delivered in the
-  root-only `/etc/sandboxpilot/worker.env`. The control plane sends it on every
-  request. Tokens never appear in `sandboxpilot worker get` output or logs.
-- Sandbox env values are write-only through the API: `SandboxInfo` exposes `env_keys`,
-  never values. Logs redact `Bearer ...` and `?token=` query strings.
+Head credentials, registry authentication and the scoped Kubernetes kubeconfig
+are protected files. No control-plane secret is mounted into user containers.
+The protected bootstrap administrator key also seeds runtime token signatures;
+rotate application keys through the key API. Rotating this master configuration
+secret invalidates existing runtime capabilities and needs planned maintenance.
 
-## What you are trusting
-
-- gVisor's isolation. It is what Google uses for App Engine and Cloud Run.
-- Your cloud IAM. SkyPilot launches VMs with the credentials on your machine; the
-  VMs themselves need no cloud permissions (and the sandboxes cannot reach the
-  metadata endpoint to borrow any).
-- The host you run the control plane on. It holds the SSH key and the SQLite state.
-
-## Not covered
-
-- Side channels between sandboxes on the same VM (shared CPU cache, etc.). Use one
-  pool per trust boundary if that matters to you.
-- Sandbox egress to the public internet. Allowed by default; use `network: none` or
-  add egress rules to the VM.
-- Data at rest on the worker's disk. Workers are disposable; sandboxes' overlay data
-  lives in `/var/lib/docker` on the VM until the VM is terminated.
-
-Found something? Open an issue marked `security` or email the maintainers before
-posting details publicly.
+The head and its administrators are trusted. K3s, containerd, gVisor and Cilium
+need security updates. A single head is not highly available, and this repository
+has not been independently security audited. The live acceptance suite verifies
+installed runtime behavior; local simulated-cluster tests do not prove isolation.

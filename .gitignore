@@ -10,3 +10,5 @@ build/
 node_modules/
 sdk/typescript/dist/
 .DS_Store
+.cache/
+.opensandbox/

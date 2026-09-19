@@ -1,1 +1,0 @@
-"""Public REST API (FastAPI)."""

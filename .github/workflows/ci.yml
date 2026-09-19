@@ -1,0 +1,42 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    env:
+      UV_PYTHON: ${{ matrix.python }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with: { enable-cache: true }
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.23.x", cache-dependency-path: agent/go.sum }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm, cache-dependency-path: sdk/typescript/package-lock.json }
+      - run: uv python install ${{ matrix.python }}
+      - run: uv sync --frozen --extra dev
+      - run: npm --prefix sdk/typescript ci
+      - run: uv run ruff format --check src tests examples
+      - run: uv run ruff check src tests examples
+      - run: uv run mypy src
+      - run: uv run pytest -q
+      - run: go -C agent test -race ./...
+      - run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go -C agent build -o /tmp/opensandbox-agent-amd64 .
+      - run: CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go -C agent build -o /tmp/opensandbox-agent-arm64 .
+      - run: uv build
+  typescript:
+    runs-on: ubuntu-latest
+    defaults:
+      run: { working-directory: sdk/typescript }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm, cache-dependency-path: sdk/typescript/package-lock.json }
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build

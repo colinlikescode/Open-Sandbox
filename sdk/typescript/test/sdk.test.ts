@@ -1,247 +1,89 @@
-// Unit tests use a fake fetch. The e2e block needs a running control plane:
-//   SANDBOXPILOT_E2E=1 SANDBOXPILOT_API_URL=http://127.0.0.1:7070 npm test
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { list } from "tar";
+import { APIError, OpenSandbox } from "../src/index.js";
+import { pack, unpack, readBounded } from "../src/files.js";
 
-import {
-  Command,
-  CommandError,
-  CommandTimeoutError,
-  Sandbox,
-  SandboxPilot,
-  SandboxPilotError,
-  TERMINAL_SANDBOX_STATES,
-  parseSse,
-} from "../src/index.js";
-import type { CommandInfo, CommandResult, Operation, SandboxInfo } from "../src/index.js";
-
-const info: SandboxInfo = {
-  id: "sbx_1",
-  short_id: "1",
-  pool: "default",
-  worker_id: "wrk_1",
-  state: "RUNNING",
-  image: "python:3.12-slim",
-  cpus: 1,
-  memory_bytes: 1024,
-  pids_limit: 512,
-  network: "internet",
-  workdir: "/workspace",
-  labels: {},
-  metadata: {},
-  created_at: "2026-01-01T00:00:00Z",
-  started_at: null,
-  ended_at: null,
-  expires_at: null,
-  error: null,
-  metrics: { warm_slot: 1 },
-  env_keys: [],
-  worker_state: "HEALTHY",
-};
-
-const cmdInfo: CommandInfo = {
-  command_id: "cmd_1",
-  sandbox_id: "sbx_1",
-  status: "RUNNING",
-  exit_code: null,
-  started_at: "",
-  finished_at: null,
-  display: "",
-  error: null,
-};
-
-function fakeFetch(handler: (url: string, init: RequestInit) => Response | Promise<Response>): typeof fetch {
-  return (async (input: string | URL | Request, init?: RequestInit) => handler(String(input), init ?? {})) as typeof fetch;
+const directories: string[] = [];
+afterEach(async () => { for (const directory of directories.splice(0)) await rm(directory, { recursive: true, force: true }); });
+async function temporary() { const directory = await mkdtemp(path.join(tmpdir(), "opensandbox-test-")); directories.push(directory); return directory; }
+const info = { id: "sb-123", state: "running", image: "python:3.13", cpu: 1, memory: 1e9, disk: 1e10, node: "worker", created_at: "2026-01-01T00:00:00Z", expires_at: "2026-01-01T01:00:00Z", error: null, metadata: {} };
+const command = { id: "cmd-1", status: "exited", exit_code: 7, stdout: "hello", stderr: "problem", truncated: false, started_at: info.created_at, finished_at: info.created_at, error: null };
+function fixture(handler: (url: string, options: RequestInit) => Response | Promise<Response>) {
+  const calls: Array<{ url: string; options: RequestInit }> = [];
+  const fetcher = vi.fn(async (input: string | URL | Request, options?: RequestInit) => {
+    const url = String(input); calls.push({ url, options: options ?? {} });
+    return handler(url, options ?? {});
+  }) as unknown as typeof fetch;
+  return { client: new OpenSandbox({ endpoint: "http://head:7070", apiKey: "secret", fetch: fetcher }), calls };
 }
 
-const json = (body: unknown, status = 200) =>
-  new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
-
-function sseStream(text: string): ReadableStream<Uint8Array> {
-  return new Response(text).body as ReadableStream<Uint8Array>;
-}
-
-describe("SandboxPilot client", () => {
-  it("sends bearer token and maps API errors", async () => {
-    const seen: string[] = [];
-    const client = new SandboxPilot({
-      url: "http://cp",
-      token: "tok",
-      fetch: fakeFetch((url, init) => {
-        seen.push(`${init.method} ${url} ${new Headers(init.headers).get("authorization")}`);
-        return json({ error: { code: "sandbox_not_found", message: "nope", hint: "check id" } }, 404);
-      }),
-    });
-    await expect(client.getSandboxInfo("sbx_x")).rejects.toMatchObject({ code: "sandbox_not_found", status: 404, hint: "check id" });
-    expect(seen[0]).toBe("GET http://cp/v1/sandboxes/sbx_x Bearer tok");
+describe("OpenSandbox SDK", () => {
+  it("authenticates, sends resource options, and maps command results", async () => {
+    const { client, calls } = fixture((url) => Response.json(url.endsWith("/commands") ? command : info));
+    const sandbox = await client.create({ cpu: 2, memory: "4gb", disk: "20gb", createTimeout: 150, idempotencyKey: "retry-1" });
+    const result = await sandbox.exec("exit 7");
+    expect(result.exitCode).toBe(7); expect(result.stdout).toBe("hello");
+    const headers = new Headers(calls[0].options.headers);
+    expect(headers.get("Authorization")).toBe("Bearer secret");
+    expect(headers.get("Idempotency-Key")).toBe("retry-1");
+    expect(JSON.parse(String(calls[0].options.body))).toMatchObject({ cpu: 2, memory: "4gb", disk: "20gb", create_timeout: 150 });
+    expect(calls[0].options.redirect).toBe("error");
   });
-
-  it("creates a sandbox with an idempotency key and runs commands", async () => {
-    const calls: Array<{ url: string; body: unknown; headers: Headers }> = [];
-    const result: CommandResult = {
-      command_id: "cmd_1",
-      exit_code: 3,
-      stdout: "out",
-      stderr: "bad",
-      started_at: "",
-      finished_at: "",
-      status: "EXITED",
-      output_truncated: false,
-      error: null,
-    };
-    const client = new SandboxPilot({
-      url: "http://cp",
-      fetch: fakeFetch((url, init) => {
-        calls.push({ url, body: init.body ? JSON.parse(String(init.body)) : undefined, headers: new Headers(init.headers) });
-        if (url.endsWith("/v1/sandboxes")) return json(info, 201);
-        if (url.endsWith("/exec")) return json(result);
-        return json(info);
-      }),
-    });
-    const sb = await Sandbox.create(
-      { image: "python:3.12-slim", env: { A: "1" }, idempotencyKey: "k1", createTimeout: 30, read_only_root: true },
-      client,
-    );
-    expect(sb.id).toBe("sbx_1");
-    expect(calls[0].headers.get("idempotency-key")).toBe("k1");
-    expect(calls[0].body).toMatchObject({ image: "python:3.12-slim", env: { A: "1" }, create_timeout: 30, read_only_root: true });
-    expect(calls[0].body).not.toHaveProperty("createTimeout");
-
-    const r = await sb.run(["sh", "-c", "exit 3"], { cwd: "/tmp" });
-    expect(r.exit_code).toBe(3);
-    expect(calls[1].body).toMatchObject({ args: ["sh", "-c", "exit 3"], cwd: "/tmp", background: false });
-    await expect(sb.run("exit 3", { check: true })).rejects.toBeInstanceOf(CommandError);
-    await expect(sb.run("exit 3", { check: true })).rejects.toMatchObject({ code: "command_error" });
+  it("exposes structured API errors", async () => {
+    const { client } = fixture(() => Response.json({ error: { code: "capacity_timeout", message: "No capacity" } }, { status: 503 }));
+    await expect(client.create()).rejects.toMatchObject({ name: "APIError", code: "capacity_timeout", status: 503 });
   });
-
-  it("raises CommandTimeoutError when the control plane reports a timeout", async () => {
-    const timedOut: CommandResult = {
-      command_id: "cmd_1",
-      exit_code: 137,
-      stdout: "",
-      stderr: "",
-      started_at: "",
-      finished_at: "",
-      status: "TIMED_OUT",
-      output_truncated: false,
-      error: "Command timed out after 1s",
-    };
-    const client = new SandboxPilot({
-      url: "http://cp",
-      fetch: fakeFetch((url) => (url.endsWith("/exec") ? json(timedOut) : json(info))),
-    });
-    const sb = await Sandbox.connect("sbx_1", client);
-    await expect(sb.run("sleep 5", { timeout: 1 })).rejects.toBeInstanceOf(CommandTimeoutError);
+  it("preserves split UTF-8 characters and final status in SSE logs", async () => {
+    const encoder = new TextEncoder();
+    const bytes = encoder.encode('data: {"seq":0,"type":"stdout","text":"🙂"}\n\ndata: {"seq":1,"type":"exit","exit_code":0}\n\n');
+    const stream = new ReadableStream<Uint8Array>({ start(controller) { for (const byte of bytes) controller.enqueue(Uint8Array.of(byte)); controller.close(); } });
+    const { client } = fixture(url => url.includes("/events") ? new Response(stream) : Response.json(url.endsWith("/commands") ? command : info));
+    const sandbox = await client.get("sb-123"); const background = await sandbox.execBackground("printf hello");
+    const events = []; for await (const event of background.streamLogs()) events.push(event);
+    expect(events[0].text).toBe("🙂"); expect(events[1].exitCode).toBe(0);
   });
-
-  it("parses SSE streams, including CRLF framing", async () => {
-    const sse =
-      'event: stdout\ndata: {"type":"stdout","text":"hi\\n","exit_code":null,"status":null,"seq":1}\n\n' +
-      'event: exit\ndata: {"type":"exit","text":"","exit_code":0,"status":"EXITED","seq":2}\n\n';
-    const client = new SandboxPilot({
-      url: "http://cp",
-      fetch: fakeFetch((url) => {
-        if (url.endsWith("/exec/start")) return json(cmdInfo, 202);
-        if (url.includes("/stream")) return new Response(sse, { status: 200 });
-        return json(info);
-      }),
-    });
-    const sb = await Sandbox.connect("sbx_1", client);
-    const events = [];
-    for await (const ev of sb.stream("echo hi")) events.push(ev);
-    expect(events.map((e) => e.type)).toEqual(["stdout", "exit"]);
-    expect(events[0].text).toBe("hi\n");
-    expect(new Command(sb, cmdInfo).id).toBe("cmd_1");
-
-    const crlf = sse.replace(/\n/g, "\r\n");
-    const parsed = [];
-    for await (const ev of parseSse(sseStream(crlf))) parsed.push(ev.type);
-    expect(parsed).toEqual(["stdout", "exit"]);
-  });
-
-  it("fetches background command logs", async () => {
-    const client = new SandboxPilot({
-      url: "http://cp",
-      fetch: fakeFetch((url) => {
-        if (url.endsWith("/exec/start")) return json(cmdInfo, 202);
-        if (url.endsWith("/logs")) return json({ command_id: "cmd_1", stdout: "partial", stderr: "", truncated: false });
-        return json(info);
-      }),
-    });
-    const sb = await Sandbox.connect("sbx_1", client);
-    const cmd = await sb.runBackground("long-running");
-    expect((await cmd.logs()).stdout).toBe("partial");
-  });
-
-  it("writes files with a sized body and no hand-rolled Content-Length", async () => {
-    let seen: RequestInit | undefined;
-    const client = new SandboxPilot({
-      url: "http://cp",
-      fetch: fakeFetch((url, init) => {
-        if (init.method !== "PUT") return json(info);
-        seen = init;
-        expect(url).toContain("/files?path=%2Fa&mode=384");
-        return json({ path: "/a", bytes: 3 });
-      }),
-    });
-    const sb = await Sandbox.connect("sbx_1", client);
-    await sb.write("/a", "abc", 0o600);
-    expect(seen?.body).toBeInstanceOf(Blob);
-    expect((seen?.body as Blob).size).toBe(3);
-    expect(new Headers(seen?.headers).has("content-length")).toBe(false);
-  });
-
-  it("waitOperation distinguishes success, failure, cancellation and timeout", async () => {
-    const op = (status: Operation["status"], error: string | null = null): Operation => ({
-      id: "op_1",
-      type: "worker.provision",
-      status,
-      pool_id: null,
-      worker_id: null,
-      sandbox_id: null,
-      created_at: "",
-      started_at: null,
-      completed_at: null,
-      error,
-      result: {},
-    });
-    let next: Operation = op("SUCCEEDED");
-    const client = new SandboxPilot({ url: "http://cp", fetch: fakeFetch(() => json(next)) });
-    expect((await client.waitOperation("op_1")).status).toBe("SUCCEEDED");
-    next = op("FAILED", "quota");
-    await expect(client.waitOperation("op_1")).rejects.toMatchObject({ code: "operation_failed", message: "quota" });
-    next = op("CANCELLED");
-    await expect(client.waitOperation("op_1")).rejects.toMatchObject({ code: "operation_failed" });
-    next = op("RUNNING");
-    await expect(client.waitOperation("op_1", 5)).rejects.toMatchObject({ code: "operation_timeout" });
-  });
-
-  it("wraps network failures", async () => {
-    const client = new SandboxPilot({ url: "http://cp", fetch: fakeFetch(() => { throw new Error("ECONNREFUSED"); }) });
-    await expect(client.health()).rejects.toBeInstanceOf(SandboxPilotError);
-  });
-
-  it("exposes terminal states", () => {
-    expect(TERMINAL_SANDBOX_STATES.has("EXPIRED")).toBe(true);
-    expect(TERMINAL_SANDBOX_STATES.has("RUNNING")).toBe(false);
+  it("uploads a local image context before creating the sandbox", async () => {
+    const directory = await temporary(); await writeFile(path.join(directory, "Dockerfile"), "FROM python:3.13\n");
+    const { client, calls } = fixture(url => Response.json(url.includes("/images/build") ? { reference: "head/image@sha256:123" } : info));
+    await client.create({ image: directory });
+    expect(calls[0].url).toContain("/images/build?dockerfile=Dockerfile");
+    expect(JSON.parse(String(calls[1].options.body)).image).toBe("head/image@sha256:123");
   });
 });
 
-describe.skipIf(!process.env.SANDBOXPILOT_E2E)("e2e against a live control plane", () => {
-  it("creates, runs, streams, reads files, kills", async () => {
-    const sb = await Sandbox.create({ timeout: "5m", env: { NAME: "ts" } });
-    try {
-      expect(sb.info.state).toBe("RUNNING");
-      const r = await sb.run("echo hello $NAME");
-      expect(r.stdout.trim()).toBe("hello ts");
-      await sb.write("/workspace/a.txt", "abc");
-      expect(await sb.readText("/workspace/a.txt")).toBe("abc");
-      const types: string[] = [];
-      for await (const ev of sb.stream("echo x; exit 2")) types.push(ev.type);
-      expect(types.at(-1)).toBe("exit");
-      expect(await sb.getUrl(8080)).toContain("/v1/proxy/");
-    } finally {
-      await sb.kill();
-    }
-    expect((await sb.refresh()).state).toBe("STOPPED");
-  }, 120_000);
+describe("transfer archives", () => {
+  it("cancels oversized streaming downloads before reading the whole response", async () => {
+    let pulls = 0; let cancelled = false;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) { pulls++; controller.enqueue(Uint8Array.of(1, 2, 3, 4)); },
+      cancel() { cancelled = true; },
+    });
+    await expect(readBounded(new Response(stream), 8)).rejects.toThrow("Download exceeds");
+    expect(pulls).toBeLessThanOrEqual(4); expect(cancelled).toBe(true);
+  });
+  it("respects Docker ignore anchoring and negated descendants", async () => {
+    const directory = await temporary();
+    await mkdir(path.join(directory, "nested")); await mkdir(path.join(directory, "ignored"));
+    await writeFile(path.join(directory, "Dockerfile"), "FROM scratch");
+    await writeFile(path.join(directory, ".dockerignore"), "secret\nignored\n!ignored/include\n");
+    await writeFile(path.join(directory, "secret"), "private");
+    await writeFile(path.join(directory, "nested/secret"), "nested allowed");
+    await writeFile(path.join(directory, "ignored/include"), "include");
+    await writeFile(path.join(directory, "ignored/exclude"), "exclude");
+    const { data } = await pack(directory, true); const names: string[] = [];
+    await new Promise<void>((resolve, reject) => {
+      const parser = list({ onReadEntry: entry => names.push(entry.path) }); parser.on("error", reject); parser.on("end", resolve); parser.end(Buffer.from(data));
+    });
+    expect(names).not.toContain("secret"); expect(names).toContain("nested/secret");
+    expect(names).toContain("ignored/include"); expect(names).not.toContain("ignored/exclude");
+  });
+  it("roundtrips binary files and empty directories", async () => {
+    const source = await temporary(); const destination = await temporary();
+    await mkdir(path.join(source, "empty")); await writeFile(path.join(source, "binary"), Buffer.from([0, 255, 10]));
+    const { data } = await pack(source); await unpack(data, destination);
+    expect(await readFile(path.join(destination, "binary"))).toEqual(Buffer.from([0, 255, 10]));
+  });
 });

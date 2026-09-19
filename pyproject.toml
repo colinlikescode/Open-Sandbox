@@ -3,14 +3,14 @@ requires = ["hatchling>=1.25"]
 build-backend = "hatchling.build"
 
 [project]
-name = "sandboxpilot"
-version = "0.1.0"
-description = "Fast, isolated CPU sandboxes on your own cloud. E2B-style sandbox API on AWS, GCP, or Azure via SkyPilot and gVisor."
+name = "opensandbox"
+version = "0.2.0"
+description = "Self-hosted gVisor sandboxes on existing Linux CPU machines, managed by Kubernetes."
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.11,<3.15"
-authors = [{ name = "SandboxPilot contributors" }]
-keywords = ["sandbox", "gvisor", "skypilot", "agents", "aws", "gcp", "azure"]
+authors = [{ name = "OpenSandbox contributors" }]
+keywords = ["sandbox", "gvisor", "kubernetes", "agents", "k3s"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
@@ -26,7 +26,7 @@ dependencies = [
   "fastapi>=0.110",
   "uvicorn[standard]>=0.27",
   "httpx>=0.27,<1",
-  "websockets>=12.0",
+  "websockets>=14.0",
   "typer>=0.12",
   "rich>=13.0",
   "pydantic>=2.6",
@@ -36,15 +36,11 @@ dependencies = [
   "prometheus-client>=0.20",
   "PyYAML>=6.0",
   "python-multipart>=0.0.9",
+  "pathspec>=0.12",
+  "bcrypt>=4.2",
 ]
 
 [project.optional-dependencies]
-worker = ["docker>=7.0"]
-skypilot = ["skypilot>=0.8"]
-aws = ["skypilot[aws]>=0.8"]
-gcp = ["skypilot[gcp]>=0.8"]
-azure = ["skypilot[azure]>=0.8"]
-all = ["skypilot[aws,gcp,azure]>=0.8", "docker>=7.0"]
 dev = [
   "pytest>=8.0",
   "pytest-asyncio>=0.23",
@@ -54,24 +50,23 @@ dev = [
   "mypy>=1.10",
   "types-PyYAML",
   "types-psutil",
-  "types-docker",
-  "docker>=7.0",
   "build>=1.2",
+  "e2b==2.51.0",
 ]
 
 [project.scripts]
-sandboxpilot = "sandboxpilot.cli:main"
-sandboxpilot-worker = "sandboxpilot.worker.app:main"
+opensandbox = "opensandbox.cli:main"
+opensandbox-server = "opensandbox.api:main"
 
 [project.urls]
-Homepage = "https://github.com/sandboxpilot/sandboxpilot"
-Documentation = "https://github.com/sandboxpilot/sandboxpilot/tree/main/docs"
+Homepage = "https://github.com/colinlikescode/Open-Daytona-Sandbox"
+Documentation = "https://github.com/colinlikescode/Open-Daytona-Sandbox/tree/main/docs"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/sandboxpilot"]
+packages = ["src/opensandbox"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/sandboxpilot", "README.md", "LICENSE", "docs"]
+include = ["src/opensandbox", "agent", "README.md", "instructions.md", "LICENSE", "docs", "examples", "uv.lock"]
 
 [tool.ruff]
 line-length = 100
@@ -109,8 +104,8 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S", "PL", "B", "RUF", "ASYNC", "SIM"]
-"src/sandboxpilot/api/routes/**" = ["PLR0917"]
-"src/sandboxpilot/cli/**" = ["PLR0917"]  # FastAPI handlers take path/query params positionally
+"src/opensandbox/api/routes/**" = ["PLR0917"]
+"src/opensandbox/cli/**" = ["PLR0917"]  # FastAPI handlers take path/query params positionally
 
 [tool.ruff.format]
 quote-style = "double"
@@ -125,7 +120,7 @@ warn_redundant_casts = true
 no_implicit_optional = true
 ignore_missing_imports = true
 plugins = ["pydantic.mypy"]
-files = ["src/sandboxpilot"]
+files = ["src/opensandbox"]
 exclude = ["tests/"]
 
 [tool.pytest.ini_options]
@@ -134,64 +129,13 @@ asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 timeout = 120
 markers = [
-  "gvisor: requires a real gVisor (runsc) Docker runtime",
-  "docker: requires a local Docker daemon (unsafe runc test runtime)",
-  "cloud_aws: provisions a real AWS worker through SkyPilot",
-  "cloud_gcp: provisions a real GCP worker through SkyPilot",
-  "cloud_azure: provisions a real Azure worker through SkyPilot",
-  "performance: latency/benchmark tests, not correctness",
+  "cluster: requires an installed Linux K3s/gVisor cluster",
 ]
-addopts = "-m 'not gvisor and not docker and not cloud_aws and not cloud_gcp and not cloud_azure and not performance'"
+addopts = "-m 'not cluster'"
 filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.coverage.run]
-source = ["sandboxpilot"]
-# Real Docker/SkyPilot paths need infrastructure; the CLI is exercised in a subprocess.
-omit = [
-  "*/worker/runtime/docker_gvisor.py",
-  "*/providers/skypilot/provider.py",
-  "*/providers/skypilot/bootstrap.py",
-  "*/cli/*",
-]
+source = ["opensandbox"]
 
 [tool.uv]
-dev-dependencies = []
-# azure-cli (pulled in by skypilot[azure]) pins a few beta azure-* packages.
-prerelease = "if-necessary-or-explicit"
-# azure-cli pins beta builds of these; letting uv see pre-releases for just them
-# keeps everything else on stable versions.
-constraint-dependencies = [
-  "azure-batch>=0a0",
-  "azure-identity>=0a0",
-  "azure-keyvault-administration>=0a0",
-  "azure-keyvault-keys>=0a0",
-  "azure-keyvault-securitydomain>=0a0",
-  "azure-mgmt-batchai>=0a0",
-  "azure-mgmt-containerinstance>=0a0",
-  "azure-mgmt-containerregistry>=0a0",
-  "azure-mgmt-datalake-store>=0a0",
-  "azure-mgmt-eventgrid>=0a0",
-  "azure-mgmt-extendedlocation>=0a0",
-  "azure-mgmt-hdinsight>=0a0",
-  "azure-mgmt-iotcentral>=0a0",
-  "azure-mgmt-loganalytics>=0a0",
-  "azure-mgmt-mysqlflexibleservers>=0a0",
-  "azure-mgmt-policyinsights>=0a0",
-  "azure-mgmt-postgresqlflexibleservers>=0a0",
-  "azure-mgmt-rdbms>=0a0",
-  "azure-mgmt-resource-deployments>=0a0",
-  "azure-mgmt-resource-deploymentscripts>=0a0",
-  "azure-mgmt-resource-deploymentstacks>=0a0",
-  "azure-mgmt-resource-templatespecs>=0a0",
-  "azure-mgmt-servicefabricmanagedclusters>=0a0",
-  "azure-mgmt-servicelinker>=0a0",
-  "azure-mgmt-signalr>=0a0",
-  "azure-mgmt-sql>=0a0",
-  "azure-mgmt-sqlvirtualmachine>=0a0",
-  "azure-mgmt-synapse>=0a0",
-  "azure-storage-blob>=0a0",
-  "microsoft-security-utilities-secret-masker>=0a0",
-  "msal>=0a0",
-]
-# Linux and macOS only. The control plane needs openssh; workers are Linux VMs.
 environments = ["sys_platform == 'linux'", "sys_platform == 'darwin'"]

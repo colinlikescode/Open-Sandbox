@@ -1,122 +1,38 @@
-# Open-Daytona-Sandbox
+# OpenSandbox
 
-Fast, isolated sandboxes for AI agents, in your own cloud account.
+**Self-hosted sandboxes for AI agents on your own CPU machines.**
 
-**What it is.** You bring an AWS, GCP or Azure account. SandboxPilot gives you an
-E2B-style sandbox API on top of it. SkyPilot creates the VMs. SandboxPilot keeps them
-warm and runs gVisor sandboxes on them.
+## What does it do?
 
-**Why it exists.** E2B, Modal and Daytona all require you to ship your code, secrets
-and the agent's outputs to their infrastructure. Every regulated buyer (healthcare,
-finance, defense, EU companies under GDPR, anyone with a SOC 2 auditor) either can't
-use them or spends months on vendor review. "Your VPC, your IAM, your audit logs, our
-open-source software" ends that conversation in one sentence.
+Clone this repo onto one of your CPU machines, or onto a dedicated Linux machine that will act as the head node, and run setup.
 
-```
- your laptop / CI box                        your cloud account (AWS, GCP or Azure)
- ┌───────────────────────────┐               ┌──────────────────────────────────────┐
- │  Python SDK / TS SDK / CLI│               │  worker VM  (launched by SkyPilot)   │
- │            │              │   ssh tunnel  │  ┌─────────┐ ┌─────────┐ ┌────────┐  │
- │  sandboxpilot control     │══════════════▶│  │ sandbox │ │ sandbox │ │sandbox │  │
- │  plane  127.0.0.1:7070    │               │  │ (gVisor)│ │ (gVisor)│ │(gVisor)│  │
- │  state: one sqlite file   │               │  └─────────┘ └─────────┘ └────────┘  │
- └───────────────────────────┘               │  worker VM ...                       │
-                                             └──────────────────────────────────────┘
-```
+That machine becomes the **OpenSandbox API and control plane**.
 
-- A sandbox starts in well under a second on a warm worker (measured on GCP: ~30 ms on
-  the worker to claim a pre-booted slot, 450 ms end to end from a laptop on another
-  continent). One VM hosts many sandboxes; you never wait for a VM to boot per sandbox.
-- Every sandbox is a gVisor (`runsc`) container. No cloud metadata access, no private
-  network access. Plain `runc` is never used silently.
-- Nothing listens on the public internet. Workers are reached over SSH tunnels.
-- You pay your cloud's VM price and nothing else. `sandboxpilot down` stops the bill.
-- AWS, GCP and Azure all go through SkyPilot. Pin a cloud or let it pick the cheapest.
+OpenSandbox uses **SSH** to bootstrap the worker machines, installs and configures **Kubernetes (K3s)** to connect and schedule across the cluster, and uses **gVisor** to isolate untrusted code inside each sandbox.
 
-## 30 seconds
+Unlike E2B's Firecracker-based stack, OpenSandbox can turn ordinary Linux VMs into a sandbox cluster without requiring KVM or specialized virtualization infrastructure. Give it machines and SSH access, and it sets up K3s + gVisor for you.
 
-```bash
-pip install "sandboxpilot[aws]"        # or [gcp], [azure], or [aws,gcp,azure]
+After setup, normal sandbox operations go through the OpenSandbox API and Kubernetes. SSH is primarily used for cluster setup and administration.
 
-sandboxpilot doctor                     # checks cloud credentials, SkyPilot, ssh
-sandboxpilot up                         # starts one warm worker (~2-4 minutes, once)
-sandboxpilot run "python3 -c 'print(1+1)'"
-```
+OpenSandbox provides an **E2B-compatible API**, making it easy to use existing E2B-style integrations and agent workflows against infrastructure you control.
 
-```python
-from sandboxpilot import Sandbox
+Use Python, TypeScript, or the CLI to:
 
-with Sandbox.create() as sb:
-    sb.write("/work/hello.py", "print('hi from gVisor')")
-    result = sb.run("python3 /work/hello.py")
-    print(result.stdout)          # hi from gVisor
-```
+- create sandboxes
+- run commands
+- read and write files
+- start processes
+- expose web apps
+- destroy sandboxes
 
-```typescript
-import { Sandbox } from "@sandboxpilot/sdk";
+The underlying machines can be cloud VMs, bare-metal servers, or other supported Linux CPU machines. You provide the compute; OpenSandbox turns it into a sandbox service.
 
-const sb = await Sandbox.create();
-console.log((await sb.run("uname -a")).stdout);
-await sb.kill();
-```
+## Why?
 
-When you are done for the day: `sandboxpilot down`. Workers are terminated, billing stops.
+Give AI agents isolated environments for running code on infrastructure you control, without building the scheduling, container, isolation, image, and sandbox API infrastructure yourself or depending on a hosted sandbox provider.
 
-## How it works
+Daytona moved its production codebase to closed source in June 2026, and its existing open-source repository is no longer maintained. OpenSandbox provides a fully open-source, self-hosted alternative where the control plane and sandbox infrastructure run entirely on machines you control.
 
-- **Workers** are cloud VMs launched by SkyPilot. One worker hosts many sandboxes.
-- **Sandboxes** are gVisor containers on a worker. Small, fast to create, killed on timeout.
-- **The control plane** runs on your machine (`127.0.0.1:7070`, started automatically by the SDK).
-  It talks to workers over SSH tunnels. State is in SQLite. Nothing is exposed to the internet.
+Its **E2B-compatible API** also makes it easier to move existing agent workloads onto your own infrastructure without redesigning the sandbox interface from scratch.
 
-Clouds are picked by SkyPilot. By default it tries AWS, GCP and Azure and takes the cheapest.
-Pin one with `sandboxpilot up --cloud aws`.
-
-## CLI
-
-```
-sandboxpilot doctor                      check control plane, credentials, SkyPilot, ssh, workers
-sandboxpilot up [--cloud X] [--workers N] start warm workers
-sandboxpilot down                        stop all workers
-sandboxpilot status                      pools, workers, sandboxes
-sandboxpilot run "<cmd>"                 run in a fresh sandbox
-sandboxpilot create [--image X]          create a sandbox, print its id
-sandboxpilot exec <id> "<cmd>"           run in an existing sandbox
-sandboxpilot cp <src> <id>:<dst>         copy files in or out
-sandboxpilot kill <id>                   kill a sandbox
-sandboxpilot bench                       measure startup latency
-```
-
-Every command can print JSON: put `--json` right after `sandboxpilot`, e.g.
-`sandboxpilot --json sandbox get <id>`. Full list: `sandboxpilot --help`.
-
-## SDK
-
-Python (sync and async) and TypeScript (`npm install @sandboxpilot/sdk`) share the same API:
-`create`, `run`, `run_background`, `stream`, `write`, `read`, `upload`, `download`,
-`get_url` (expose a port), `set_timeout`, `kill`. See [docs/sdk.md](docs/sdk.md).
-
-## Docs
-
-- [Cloud setup (AWS, GCP, Azure)](docs/clouds.md)
-- [Pools, sizing and scaling](docs/pools.md)
-- [SDK reference](docs/sdk.md)
-- [Architecture](docs/architecture.md)
-- [Security model](docs/security.md)
-- [Troubleshooting](docs/troubleshooting.md)
-
-## Development
-
-```bash
-uv sync --extra dev
-uv run pytest                 # fake provider + fake runtime, no cloud needed
-uv run ruff format --check src tests && uv run ruff check src tests && uv run mypy src
-cd sdk/typescript && npm ci && npm run lint && npm test
-```
-
-Real gVisor and cloud tests are opt-in: `pytest -m gvisor` on a Linux box with `runsc`,
-`pytest -m cloud_aws` with credentials.
-
-## License
-
-Apache 2.0
+See [instructions.md](https://chatgpt.com/c/instructions.md) for more details.

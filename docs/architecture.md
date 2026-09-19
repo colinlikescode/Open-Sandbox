@@ -1,111 +1,56 @@
 # Architecture
 
-Three pieces. Two of them run on your machine.
-
+```mermaid
+flowchart TD
+    SDK[Official E2B SDKs] --> API[Head HTTPS API]
+    CLI[OpenSandbox CLI] --> API
+    API --> E2B[E2B adapter]
+    API --> Admin[Native and admin API]
+    E2B --> Domain[Sandbox service]
+    Admin --> Domain
+    Domain --> State[SQLite product metadata]
+    Domain --> K3s[K3s scheduling and lifecycle]
+    K3s --> Workers[Existing Linux CPU machines]
+    Workers --> Runtime[containerd + runsc]
+    Runtime --> Sandboxes[gVisor sandboxes and companion]
+    API --> Proxy[Authenticated runtime and port gateway]
+    Proxy --> Sandboxes
+    Registry[Head OCI registry] --> Workers
 ```
- your machine                                        your cloud account
- ┌────────────────────────────────┐                  ┌──────────────────────────────────┐
- │ CLI / Python SDK / TS SDK      │                  │ worker VM (SkyPilot cluster)     │
- │        │ HTTP 127.0.0.1:7070   │                  │  sandboxpilot-worker :8080       │
- │        ▼                       │   ssh -L tunnel  │   │ Docker Engine API            │
- │ control plane (FastAPI)  ──────┼─────────────────▶│   ▼                              │
- │  scheduler · reconciler        │                  │  runsc  runsc  runsc  (warm slot)│
- │  sqlite state · templates      │                  └──────────────────────────────────┘
- └────────────────────────────────┘                   ... more workers per pool
-```
 
-## Control plane (`sandboxpilot.control`, `sandboxpilot.api`)
+`opensandbox.e2b` owns protocol translation and SDK routing. `Service` owns
+sandbox lifecycle and product metadata. `cluster.kube` owns Kubernetes REST and
+loopback port forwarding. The Go companion owns commands, process groups, PTYs
+and files inside each gVisor sandbox. Kubernetes owns placement and resource
+accounting; there is no second scheduler.
 
-One process, started on demand by the SDK/CLI (`sandboxpilot daemon start`). Binds to
-loopback by default; binding anywhere else requires an API token.
+The head runs a systemd API service, K3s server and authenticated TLS registry.
+Workers run K3s agent, containerd and runsc. SSH is used for installation and
+administrative operations only. A dedicated head receives no verified sandbox
+label, so RuntimeClass scheduling excludes it. A single-node head may receive
+that label and run workloads.
 
-- `control/service.py` – the `ControlPlane`. Owns pools, workers, sandboxes, operations.
-  Every public method is one API call.
-- `scheduler/` – pure functions. `binpack.select_worker` picks the tightest fit,
-  `scaler.py` decides scale up/down, `capacity.py` tracks reservations so two concurrent
-  creates never overbook a worker.
-- `control/tunnels.py` – one `ssh -N -L` per worker. The worker API never has a public
-  port. `FakeTunnelManager` is used in tests.
-- `control/worker_client.py` – typed HTTP client for the worker API, with per-worker
-  connection pooling.
-- `state/` – SQLite through aiosqlite. Numbered migrations in `state/migrations/`.
-  Repositories are thin; no ORM.
-- `api/routes/` – one module per resource. Errors are `SandboxPilotError` subclasses
-  and always serialize to `{"error": {"code", "message", "hint"}}`.
+Sandboxes are Jobs with one pod, no retries and an adjustable deadline. Job
+failure policy prevents replacing disrupted sandboxes. The head marks failed
+workers' sandboxes lost and deletes their Jobs. The companion also enforces
+expiry. API restarts reconcile existing workloads and retain background commands.
 
-On startup the control plane reconciles: workers that were mid-provision are
-terminated, sandboxes that were mid-create are checked against their worker, dead
-tunnels are reopened. Losing the control plane process never loses a sandbox.
+Product metadata, identities, key hashes, templates, audit entries and counters
+are persisted behind the `Store` abstraction. Kubernetes is authoritative for
+workload state and capacity. A database migration is required before swapping
+SQLite for another backend; PostgreSQL is not implemented in this release.
 
-## Provider (`sandboxpilot.providers`)
+The companion is compiled for amd64 and arm64 and published as a multiarch OCI
+image. An init container copies it into a read-only shared volume in the user
+image. User containers run this companion as PID 1. Images do not need a custom
+base image; E2B command shells require bash. Builders use a separate namespace
+and temporary registry pull capabilities; the head publishes the output archive.
 
-`ComputeProvider` has three real methods: `provision`, `terminate`, `list_clusters`.
-The only production implementation is `SkyPilotComputeProvider`. AWS, GCP and Azure
-are never touched directly; `tests/unit/test_skypilot_only.py` fails the build if a
-cloud SDK import shows up.
+Cilium supplies networking and explicit deny rules for host/cluster traffic.
+This closes the node-traffic exception in ordinary Kubernetes NetworkPolicy.
+The gateway authenticates SDK runtime headers or parses the wildcard application
+hostname, then uses a Kubernetes port forward to sandbox loopback. HTTP and
+WebSocket requests therefore never expose worker IPs.
 
-Provisioning = `sky.launch` of a task whose `setup` runs `bootstrap-worker.sh`: install
-Docker + gVisor, register `runsc` as a Docker runtime, install the `sandboxpilot`
-package (from PyPI or a wheel of your checkout), write `/etc/sandboxpilot/worker.env`,
-enable the systemd unit, and verify `docker run --runtime=runsc` actually works. If
-that check fails the worker never reports ready. Since SkyPilot 0.9 `launch` returns
-as soon as the job is *submitted*, so the provider then follows the job (`tail_logs`,
-falling back to `job_status` polling) until the bootstrap has finished before it opens
-the tunnel. Measured on GCP (`n4-standard-8`, Ubuntu 22.04): about 5 minutes from
-request to HEALTHY, most of it apt + gVisor + pip.
-
-`FakeComputeProvider` runs real `WorkerService` instances in-process. Everything in
-`tests/` except the `gvisor`/`docker`/`cloud_*` markers runs against it.
-
-## Worker (`sandboxpilot.worker`)
-
-A FastAPI app on the VM, reachable only through the tunnel, authenticated with a
-per-worker bearer token.
-
-- `service.py` – `WorkerService`: create/kill sandboxes, run commands, files, reaper,
-  warm slots, capacity accounting, crash-safe state in `/var/lib/sandboxpilot`.
-- `runtime/base.py` – `SandboxRuntime` interface. `docker_gvisor.py` is the real one
-  (Docker Engine API + `runsc`). `fake.py` is an in-memory implementation with a tiny
-  shell, used by tests and the fake provider.
-- `commands.py` – bounded output buffers, streaming, timeouts, kill.
-- `firewall.py` – iptables rules on the sandbox bridge: drop 169.254.0.0/16, RFC1918
-  and 100.64.0.0/10 so a sandbox cannot reach cloud metadata or anything else in your
-  VPC, plus an INPUT chain so it cannot reach the worker VM itself.
-
-Two gVisor facts shape the runtime (`runtime/docker_gvisor.py`):
-
-- gVisor's netstack owns the sandbox's loopback, so Docker's embedded DNS at
-  `127.0.0.11` is unreachable. Every sandbox gets a read-only `/etc/resolv.conf`
-  naming public resolvers instead.
-- gVisor caches the rootfs and keeps the sandbox's writes in its own overlay, so
-  `docker cp` is unreliable in both directions once a sandbox is running. File
-  transfer streams a tar into `tar -x` (upload) and out of `tar -c` (download) executed
-  *inside* the sandbox; `docker cp` is only a fallback for images without `tar`.
-
-## Warm slots
-
-A cold `runsc` boot is 100-300 ms on cloud VMs (mostly Sentry init, worse on
-high-core-count instances). Workers therefore keep `warm_slots` sandboxes pre-booted
-with the pool's default spec. A create request whose image/network/user/workdir match
-claims one: the container is renamed, its cgroup limits are updated live to the
-requested CPU/memory/pids, env is injected per exec. The pool refills in the
-background. Non-matching requests take the cold path, evicting a warm slot if one is
-holding the capacity they need. Reported capacity excludes warm slots, so the
-scheduler treats them as free space.
-
-## Request path for `Sandbox.create()`
-
-1. SDK checks `GET /v1/health`; starts the daemon if nothing answers on loopback.
-2. Control plane merges template + pool defaults into a `SandboxSpec`, inserts a
-   `PENDING` record, and asks the scheduler for a worker.
-3. No fit → scale decision. Scale-up provisions a worker through SkyPilot (minutes);
-   the create waits up to `create_timeout` for capacity.
-4. Fit → `POST /v1/sandboxes` on the worker through the tunnel. The worker claims a
-   warm slot or cold-creates a `runsc` container, verifies it can exec, returns.
-5. Record moves to `RUNNING`. Commands, files and proxy requests are forwarded to the
-   same worker for the sandbox's lifetime.
-
-## Where to start reading
-
-New engineer? `control/service.py` (`create_sandbox`), then `worker/service.py`
-(`_create`, `_claim_warm`), then `providers/skypilot/provider.py` (`provision`).
+See [instructions](../instructions.md) for installation, failure semantics and
+operational limits. Real Linux acceptance is distinct from local protocol tests.

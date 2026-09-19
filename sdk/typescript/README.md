@@ -1,37 +1,33 @@
-# @sandboxpilot/sdk
+# @opensandbox/sdk
 
-TypeScript client for [SandboxPilot](https://github.com/sandboxpilot/sandboxpilot): fast gVisor
-sandboxes on VMs in your own AWS, GCP or Azure account.
+Optional native TypeScript client for OpenSandbox. For existing agent applications,
+use the official `e2b` package and the repository's [setup instructions](../../instructions.md).
+
+Build this package from the checkout:
 
 ```bash
-npm install @sandboxpilot/sdk
-sandboxpilot daemon start        # the SDK talks to the local control plane (Python package)
+npm ci
+npm run build
 ```
 
 ```typescript
-import { Sandbox } from "@sandboxpilot/sdk";
+import { OpenSandbox } from '@opensandbox/sdk'
 
-const sb = await Sandbox.create({ image: "python:3.12-slim", timeout: "30m" });
+const client = new OpenSandbox({
+  endpoint: process.env.OPENSANDBOX_ENDPOINT,
+  apiKey: process.env.OPENSANDBOX_API_KEY,
+})
+const sandbox = await client.create({ cpu: 1, memory: '1Gi', timeout: 300 })
 try {
-  await sb.write("/workspace/hello.py", "print('hi from gVisor')");
-  const r = await sb.run("python3 /workspace/hello.py", { check: true });
-  console.log(r.stdout);
-
-  for await (const ev of sb.stream("for i in 1 2 3; do echo $i; sleep 1; done")) {
-    if (ev.type === "stdout") process.stdout.write(ev.text);
-  }
-
-  const url = await sb.getUrl(8080); // signed URL proxied to a port inside the sandbox
+  console.log((await sandbox.exec('printf hello')).stdout)
 } finally {
-  await sb.kill();
+  await sandbox.destroy()
 }
 ```
 
-Configuration: `SANDBOXPILOT_API_URL` (default `http://127.0.0.1:7070`) and
-`SANDBOXPILOT_API_TOKEN` (required when the control plane is not on loopback), or pass
-`new SandboxPilot({ url, token })` to `Sandbox.create`/`Sandbox.connect`.
+Node 22+ is required. Trust the head's CA with `NODE_EXTRA_CA_CERTS` before starting
+Node. The client always connects to the remote head and never starts a local
+control plane. This package is built locally; setup does not publish it.
 
-Unlike the Python SDK this client cannot start the control plane for you: run
-`sandboxpilot daemon start` first. Requires Node 18+ (global `fetch`).
-
-Full API and wire types: see `docs/sdk.md` in the main repository.
+`npm run test:e2e` runs the official E2B TypeScript compatibility scenario against
+an installed cluster configured through the `E2B_*` environment variables.

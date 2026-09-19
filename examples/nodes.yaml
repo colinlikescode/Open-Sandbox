@@ -1,0 +1,20 @@
+# Run setup from a checkout on this head machine.
+head:
+  host: 10.0.0.1
+  name: head
+  sandboxes: true
+
+# For one machine, use workers: []. For a dedicated head, set sandboxes: false.
+workers:
+  - host: 10.0.0.2
+    name: worker-1
+  - host: 10.0.0.3
+    name: worker-2
+
+ssh:
+  user: ubuntu
+  key: ~/.ssh/id_ed25519
+
+# Optional: wildcard DNS pointing at the head. Include the public API port.
+# Otherwise setup uses <head-ip>.sslip.io:7070.
+# sandbox_domain: sandbox.example.com:7070
